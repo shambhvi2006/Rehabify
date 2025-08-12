@@ -42,6 +42,7 @@
       <div class="panel">
         <div class="metrics">
           <div>Score: <span class="big" id="score">0</span></div>
+          <div>Stars: <span class="big" id="stars">0</span></div>
           <div>Streak: <span class="big" id="streak">0</span></div>
           <div>Energy:</div>
           <progress id="energy" value="100" max="100"></progress>
@@ -65,202 +66,457 @@
     const ctx     = canvas.getContext('2d');
     const startBtn= document.getElementById('startBtn');
     const scoreEl = document.getElementById('score');
+    const starsEl = document.getElementById('stars');
     const streakEl= document.getElementById('streak');
     const energyEl= document.getElementById('energy');
     const mascot  = document.getElementById('mascot');
     const statusEl= document.getElementById('status');
     function status(msg){ statusEl.textContent = msg; console.log(msg); }
 
-    //state
-    let score=0, streak=0, energy=100, running=false;//running false helps preventing it from running multiple times
+    // ---------- GAME/POSE STATE
+    let score=0, streak=0, energy=100, running=false;
+    let starCount=0;
     let lastRepAt=0, framesCorrect=0;
-    const REP_COOLDOWN_MS=600, NEED_CONSEC_FRAMES=3, VIS_THRESH=0.4;//hum keh rahe hai  ki ek sahi rep has to be held for 0.6sec and ese 3 reps equal to one countable rep
-    //visthreshh??? visibility threshold hai, matlab agar kisi landmark ki visibility is threshold se kam hai to wo consider nahi hoga
-    //but how are we defining landmarkkk?? landmarks are defined as the key points on the body that we want to track, such as the wrists, elbows, and shoulders.
-    // framesCorrect is used to count how many consecutive frames the user has held the correct position
-    //visthresh 0.4 hone ka kya matlab hai? iska matlab hai ki agar kisi landmark ki visibility 0.4 se kam hai to wo landmark consider nahi hoga
-    //toh if i increase the vis thresh the strictness increases? yas queen
-    //landmark = one of the 33 body keypoints (nose, shoulders, elbows, wrists, hips, knees, ankles, etc.).
-    //Threshold = the minimum visibility value we require
+    let latestLm = null;
 
-    // drawing the camera on the canvas
-    //Must be called after the video metadata loads, otherwise width/height may be 0.
-    //isiliye we use await neeche jake
-    
-    function setCanvasSize(){ canvas.width=video.videoWidth; canvas.height=video.videoHeight; }
-    //That puts the live camera image on the canvas so we can paint on top (dots, text, UI).
+    // Tunables
+    const REP_COOLDOWN_MS=600, NEED_CONSEC_FRAMES=3, VIS_THRESH=0.25;
+
+    // ---------- AUDIO (ding)
+    let audioCtx=null;
+    function initAudio(){ 
+        if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)(); 
+    }// Creates a single global AudioContext the first time you call it.
+
+    function playDing(){
+      if (!audioCtx) return;
+      const o = audioCtx.createOscillator();//Creates a tone generator
+      const g = audioCtx.createGain();//creates a volume node
+      o.type='sine'; //pure tone
+      o.frequency.value=880;//pitch
+      o.connect(g); 
+      g.connect(audioCtx.destination);
+      const t = audioCtx.currentTime;//precise audio clock
+      g.gain.setValueAtTime(0, t);//starts silent
+      g.gain.linearRampToValueAtTime(0.6, t+0.01);//quick fade in 10 ms
+      g.gain.exponentialRampToValueAtTime(0.0001, t+0.25);//fadeout
+      o.start(t); // start
+      o.stop(t+0.26);//stop
+    }
+
+    // ---------- CANVAS
+    function setCanvasSize(){ 
+      canvas.width=video.videoWidth; 
+      canvas.height=video.videoHeight; 
+      TARGET_SPAWN_Y = -60;                     
+      //Setting TARGET_SPAWN_Y to -60 means the star starts 60 pixels above the visible area (off-screen), then falls into view.
+      MISS_Y = canvas.height * MISS_Y_FRAC;     
+      //This calculates the “miss line”: if a star falls below this Y value without being hit, it counts as missed and disappears.
+    }
     function drawCameraFrame(){
       if (video.readyState >= 2) {
-        ctx.save(); ctx.scale(-1,1);//mirrorrrrrr kar deta hai videoooooo whoop whoop
-        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);//this is getting the live video on the canvas
+        //video.readyState is a number:
+        //0: HAVE_NOTHING
+        //1: HAVE_METADATA
+        //2: HAVE_CURRENT_DATA
+        //3: HAVE_FUTURE_DATA
+        //4: HAVE_ENOUGH_DATA
+        ctx.save();
+        ctx.scale(-1,1);
+        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
         ctx.restore();
       }
     }
-    function renderLoop(){ drawCameraFrame(); requestAnimationFrame(renderLoop); }
-    //A perpetual loop that always paints the latest camera frame—even if the ML model hasn’t produced landmarks yet. 
-    // This guarantees you can see yourself.
 
-
-    //the dotiesssssss
-    function drawLandmarks(lms){//lms is the array of landmarks from mediapipe
-      //each item looks like {x: 0.5, y: 0.5, visibility: 0.8} with x/y normalized in [0,1] relative to the video frame 
-      // (origin is top-left, so smaller y = higher).
-      if (!lms) return;
-      ctx.fillStyle='#FFC0CB';
-      for (const p of lms){
-        const x=(1-p.x)*canvas.width, y=p.y*canvas.height; // mirroring x warna instead of 1-p.x we would do p.x
-        ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.fill();//these are the dots on the canvas
-        // draw visibility as a circle radius 3px
-        //what is math.pi*2? Math.PI*2 is a full circle in radians (360 degrees).
-      }
+    // ---------- LANDMARK UTILS
+    function toPix(p){ 
+        return { 
+            x:(1-p.x)*canvas.width, 
+            y:p.y*canvas.height, 
+            c:(p.visibility ?? 1) 
+        }; 
     }
+    const visOK = p => !p || p.visibility===undefined || p.visibility>=VIS_THRESH;
 
-
-    const visOK=p=>!p || p.visibility===undefined || p.visibility>=VIS_THRESH;//decide if a single landmark is reliable enough to use.
-    //visibility: a confidence value from ~0 to 1. Higher = the model is more certain that landmark is visible/not occluded.
     function angle(a,b,c){
       const abx=a.x-b.x, aby=a.y-b.y, cbx=c.x-b.x, cby=c.y-b.y;
       const dot=abx*cbx+aby*cby, mag=Math.hypot(abx,aby)*Math.hypot(cbx,cby)+1e-6;
       return Math.acos(Math.max(-1,Math.min(1,dot/mag)))*180/Math.PI;
-
-      //here we are computing the angles formed by the three points a, b, and c using the dot product formula.
-      //b will be the elbow joint 
-      //toh ba aur bc nikalke
-      //cos θ = (BA · BC) / (|BA| |BC|) = (abx*cbx + aby*cby) / (|BA||BC|)
-      //+ 1e-6 to the denominator: avoids division by zero if a limb is perfectly straight/zero-length due to noise.
-      //Math.max(-1, Math.min(1, ...)): clamps for tiny floating-point errors 
-      // so acos() never gets a value slightly outside [-1,1]
     }
-    //Why we need it: to check elbow “openness” (e.g., > 120°) so half-bent arms don’t accidentally count as “arms up.”
 
+    function drawLandmarks(lms){
+      if (!lms) return;
+      ctx.fillStyle='#FFC0CB';
+      for (const p of lms){
+        const q=toPix(p);
+        ctx.beginPath(); ctx.arc(q.x, q.y, 3, 0, Math.PI*2); ctx.fill();
+      }
+      if (lms[15]) { const q=toPix(lms[15]); ctx.beginPath(); ctx.arc(q.x,q.y,6,0,Math.PI*2); ctx.fill(); }
+      if (lms[16]) { const q=toPix(lms[16]); ctx.beginPath(); ctx.arc(q.x,q.y,6,0,Math.PI*2); ctx.fill(); }
+    }
 
-    // ---------- exercise logic
+    // ---------- FORM CHECK (existing)
     function isArmsUp(lm){
-      const Ls=lm[11], Le=lm[13], Lw=lm[15];//left shoulder,elbow,wrist 
-
-      const Rs=lm[12], Re=lm[14], Rw=lm[16];//right shoulder,elbow,wrist
-
+      const Ls=lm[11], Le=lm[13], Lw=lm[15];
+      const Rs=lm[12], Re=lm[14], Rw=lm[16];
       if (![Ls,Le,Lw,Rs,Re,Rw].every(visOK)) return false;
-      //If any of those six points is missing or has low visibility, we don’t trust the frame → return false
 
       const wristsAbove=(Lw.y < Ls.y - 0.02) && (Rw.y < Rs.y - 0.02);
-      //So “wrist above shoulder” means wrist.y < shoulder.y.
-      //The extra - 0.02 is a margin (~2% of frame height) so borderline frames don’t flicker between true/false.
-      //Both wrists must be above their own shoulder.
-      const leftElbow=angle(Ls,Le,Lw), rightElbow=angle(Rs,Re,Rw);//abh elbow beech mei hai toh apne aap b ban jayega w2e can exchange the shoulder and wrist
-      //angle yahan mera wala hi function hai
+      const leftElbow=angle(Ls,Le,Lw), rightElbow=angle(Rs,Re,Rw);
       const elbowsOpen=(leftElbow>120 && rightElbow>120);
-      //110 easier and 140 stricter
-
-      // debug
-    //   ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(12,12,240,70);
-    //   ctx.fillStyle='#fff'; ctx.font='14px ui-monospace,monospace';
-    //   ctx.fillText(`wristsAbove: ${wristsAbove}`, 20, 34);
-    //   ctx.fillText(`L/R elbow: ${leftElbow|0} / ${rightElbow|0}`, 20, 56);
-      //This puts a small box on the canvas with live values—super useful while testing.
-      //jo mere running wale ke peeche box aata hai the wristabove true ya false
-
-      // --- debug HUD (top-right) ---
-        const pad = 12;
-        const boxW = 240, boxH = 70;
-        const x = canvas.width - pad - boxW;  // top-right X
-        const y = pad;                        // top-right Y
-
-        ctx.fillStyle = 'rgba(0,0,0,0.5)';
-        ctx.fillRect(x, y, boxW, boxH);
-
-        ctx.fillStyle = '#fff';
-        ctx.font = '14px ui-monospace,monospace';
-        ctx.fillText(`wristsAbove: ${wristsAbove}`, x + 8, y + 22);
-        ctx.fillText(`L/R elbow: ${leftElbow|0} / ${rightElbow|0}`, x + 8, y + 44);
-        //This uses the current canvas.width, so it’ll stay glued to the top-right even if the canvas size changes.
-
-
       return wristsAbove && elbowsOpen;
     }
 
-
     function bopMascot(){ 
-        mascot.classList.remove('celebrate'); 
-        void mascot.offsetWidth; //Force reflow with void mascot.offsetWidth;: This is a tiny trick to make the browser “commit” the removal, so the next addition is treated as a fresh animation.
-        mascot.classList.add('celebrate'); 
+      mascot.classList.remove('celebrate'); 
+      void mascot.offsetWidth;
+      mascot.classList.add('celebrate'); 
     }
-    function updateGame(correct){//correct: boolean from isArmsUp(lm) for this frame only
-      const now=Date.now();//Current time in ms; used to ensure we don’t count multiple reps too quickly
-      if (correct) framesCorrect++; else framesCorrect=0;//We require NEED_CONSEC_FRAMES correct frames in a row (e.g., 3) so momentary noise doesn’t score
+
+    function updateGame(correct){
+      const now=Date.now();
+      if (correct) framesCorrect++; else framesCorrect=0;
       if (framesCorrect>=NEED_CONSEC_FRAMES && (now-lastRepAt)>REP_COOLDOWN_MS){
-        // pose has been stable for a short moment
-        //  This prevents “holding” a pose from racking up points.
         score+=10; streak+=1; energy=Math.min(100, energy+4);
         lastRepAt=now; framesCorrect=0; bopMascot();
       } else if (!correct) {
         streak=0; energy=Math.max(0, energy-0.4);
-        // break the streak, motivating consistent form.
-        // drain energy slightly, with a floor at 0.
       }
       scoreEl.textContent=score; streakEl.textContent=streak; energyEl.value=energy;
     }
 
-    // ---------- start
-    async function start(){//async await so that we wait for the camera to get loaded
-      if (running) return; running=true;//running is a guard so you don’t start two capture loops if the button is clicked twice
+    // ---------- FALLING NOTES (single-star mode)
+    const SINGLE_STAR_MODE = true;
+    const LANES = [0.18, 0.38, 0.50, 0.62, 0.82];  // % width positions
+    const HAND_BONUS = 28;                         // forgiving hitbox
+    const ELBOW_STRAIGHT_DEG = 150;
+    const NOTE_SPEED_PX_S = 100;                   // falling speed (px/sec)
+    const MISS_Y_FRAC = 0.60;                      // miss if star falls past this
+    let   TARGET_SPAWN_Y = -60;                    // set in setCanvasSize
+    let   MISS_Y = 300;                            // set in setCanvasSize
+    const HIT_GRACE_FRAMES = 2;                    // frames inside to register a hit
+    const POST_HIT_DESPAWN_MS = 700;               // explosion duration
+    const NEXT_DELAY_MS = 300;                     // delay before next star appears
+
+    const SMOOTH_ALPHA = 0.35;
+    const SIDE = { L:'left', R:'right' };
+
+    let stars = []; // at most 1 item
+    let lastHitAt = 0;
+    let feedbackMsg = '';
+    let combo = 0;
+    let nextAllowedSpawnAt = 0; // enforce delay after resolve
+
+    const smooth = {
+      leftWrist:null, rightWrist:null,
+      leftElbow:null, rightElbow:null,
+      leftShoulder:null, rightShoulder:null
+    };
+
+    function ema(prev, curr) {
+      if (!prev) return {x:curr.x, y:curr.y, c:curr.c ?? 1};
+      return {
+        x: prev.x + SMOOTH_ALPHA*(curr.x - prev.x),
+        y: prev.y + SMOOTH_ALPHA*(curr.y - prev.y),
+        c: Math.max(prev.c ?? 0, curr.c ?? 0)
+      };
+    }
+    function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+    function elbowAngle(shoulder, elbow, wrist) {
+      const ux = shoulder.x - elbow.x, uy = shoulder.y - elbow.y;
+      const vx = wrist.x - elbow.x,   vy = wrist.y - elbow.y;
+      const dot = ux*vx + uy*vy;
+      const mu = Math.hypot(ux,uy) * Math.hypot(vx,vy);
+      if (mu === 0) return 180;
+      let cos = dot / mu;
+      cos = Math.max(-1, Math.min(1, cos));
+      return (Math.acos(cos)*180/Math.PI);
+    }
+
+    function starPath(cx, cy, spikes, outerR, innerR, rotation=-Math.PI/2){
+      const step = Math.PI / spikes;
+      ctx.beginPath();
+      for (let i=0;i<spikes*2;i++){
+        const r = (i%2===0) ? outerR : innerR;
+        const a = i*step + rotation;
+        const x = cx + Math.cos(a)*r;
+        const y = cy + Math.sin(a)*r;
+        if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.closePath();
+    }
+
+    function spawnExplosionParticles(x,y,color){
+      const parts=[];
+      for (let i=0;i<16;i++){
+        const a = (i/16)*Math.PI*2 + Math.random()*0.3;
+        const sp = 2.2 + Math.random()*2.2;
+        parts.push({
+          x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp,
+          life: 520 + Math.random()*200, born: performance.now(), color
+        });
+      }
+      return parts;
+    }
+
+    function spawnSingleStar(now){
+      if (!SINGLE_STAR_MODE) return;
+      if (stars.length>0 || now < nextAllowedSpawnAt) return;
+      const lane = Math.floor(Math.random()*LANES.length);
+      const side = (Math.random()<0.5) ? SIDE.L : SIDE.R;
+      const baseR = Math.max(30, Math.min(60, canvas.width*0.035));
+      const x = canvas.width * LANES[lane];
+      stars = [{
+        x, y: TARGET_SPAWN_Y, r: baseR,
+        vy: NOTE_SPEED_PX_S, side,
+        spawnedAt: now,
+        hit:false, hitAt:0, holdFrames:0, inside:false,
+        particles:[]
+      }];
+    }
+
+    // main update for targets (with dt in seconds)
+    function updateCoachAndTargets(lm, dt, now){
+      // smooth keypoints
+      if (lm) {
+        const LW = toPix(lm[15]), RW = toPix(lm[16]);
+        const LE = toPix(lm[13]), RE = toPix(lm[14]);
+        const LS = toPix(lm[11]), RS = toPix(lm[12]);
+
+        if (visOK(lm[15])) smooth.leftWrist  = ema(smooth.leftWrist, LW);
+        if (visOK(lm[16])) smooth.rightWrist = ema(smooth.rightWrist, RW);
+        if (visOK(lm[13])) smooth.leftElbow  = ema(smooth.leftElbow, LE);
+        if (visOK(lm[14])) smooth.rightElbow = ema(smooth.rightElbow, RE);
+        if (visOK(lm[11])) smooth.leftShoulder = ema(smooth.leftShoulder, LS);
+        if (visOK(lm[12])) smooth.rightShoulder= ema(smooth.rightShoulder, RS);
+      }
+
+      // ensure exactly one star active
+      spawnSingleStar(now);
+
+      let bestMsg = '';
+
+      for (const s of stars){
+        // fall
+        if (!s.hit){
+          s.y += s.vy * dt; // constant speed fall
+
+          const wrist   = s.side===SIDE.L ? smooth.leftWrist  : smooth.rightWrist;
+          const shoulder= s.side===SIDE.L ? smooth.leftShoulder: smooth.rightShoulder;
+          const elbow   = s.side===SIDE.L ? smooth.leftElbow  : smooth.rightElbow;
+
+          s.inside = false;
+
+          if (wrist && shoulder && elbow){
+            if (dist(wrist, s) <= s.r + HAND_BONUS){
+              s.inside = true;
+              s.holdFrames++;
+              if (s.holdFrames >= HIT_GRACE_FRAMES && now - lastHitAt > 200) {
+                // HIT!
+                s.hit = true;
+                s.hitAt = now;
+                lastHitAt = now;
+                combo++; score += 15; starCount += 1; streak += 1;
+                energy = Math.min(100, energy+6);
+                s.particles = spawnExplosionParticles(s.x, s.y, s.side===SIDE.L ? '#ffd54a' : '#ff9bd3');
+                playDing(); bopMascot();
+              }
+            } else {
+              s.holdFrames = 0;
+              if (!bestMsg) bestMsg = correctionFor(s.side, wrist, shoulder, elbow, s);
+            }
+          }
+
+          // Miss if it falls too low
+          if (!s.hit && s.y > MISS_Y){
+            combo = 0;
+            energy = Math.max(0, energy - 3);
+            // remove immediately and schedule next
+            stars = [];
+            nextAllowedSpawnAt = now + NEXT_DELAY_MS;
+          }
+        }
+
+        // update particles & cleanup hit star
+        if (s.hit){
+          // update particles
+          if (s.particles && s.particles.length){
+            for (const p of s.particles){
+              const age = now - p.born;
+              p.x += p.vx; p.y += p.vy;
+              p.vx *= 0.98; p.vy = p.vy*0.98 + 0.06; // gravity
+              p.dead = age > p.life;
+            }
+            s.particles = s.particles.filter(p=>!p.dead);
+          }
+          // despawn after explosion window
+          if (now - s.hitAt > POST_HIT_DESPAWN_MS){
+            stars = [];
+            nextAllowedSpawnAt = now + NEXT_DELAY_MS; // only then the next appears
+          }
+        }
+      }
+
+      feedbackMsg = bestMsg;
+      // reflect counters
+      scoreEl.textContent=score; streakEl.textContent=streak; energyEl.value=energy; starsEl.textContent = starCount;
+    }
+
+    function correctionFor(side, wrist, shoulder, elbow, target) {
+      if (!wrist || !shoulder || !elbow) return '';
+      const msgs = [];
+      const verticalGap = wrist.y - target.y;
+      if (verticalGap > -12) msgs.push(`Raise your ${side} hand higher`);
+      else if (verticalGap < -80) msgs.push(`Lower ${side} hand a bit`);
+      const horizontalGap = wrist.x - target.x;
+      if (Math.abs(horizontalGap) > 40)
+        msgs.push(horizontalGap > 0 ? `Move ${side} hand left` : `Move ${side} hand right`);
+      const ang = elbowAngle(shoulder, elbow, wrist);
+      if (ang < ELBOW_STRAIGHT_DEG) msgs.push(`Straighten your ${side} arm`);
+      return msgs[0] ?? '';
+    }
+
+    function drawStarsAndUI(now){
+      // draw stars (falling + hit animation)
+      stars.forEach(s => {
+        ctx.save();
+        const isLeft = s.side===SIDE.L;
+
+        const idleFill = isLeft ? '#4da3ff' : '#ff6fb0';
+        const idleGlow = isLeft ? 'rgba(80,160,255,0.25)' : 'rgba(255,120,180,0.25)';
+        const insideFill = '#ffd54a';
+        const stroke = '#ffffffcc';
+
+        let r = s.r, alpha = 1;
+
+        if (!s.hit){
+          const t = now - s.spawnedAt;
+          const pulse = 1 + 0.12*Math.sin(t/220);
+          r = s.r * pulse;
+        } else {
+          const dt = (now - s.hitAt);
+          const k = Math.min(1, dt/350);
+          r = s.r * (1 + 0.9*k);        // pop
+          alpha = 1 - Math.min(1, dt/650);
+        }
+
+        // glow
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, r+12, 0, Math.PI*2);
+        ctx.fillStyle = idleGlow; ctx.fill();
+
+        // star glyph
+        ctx.shadowColor = s.inside ? insideFill : idleFill; 
+        ctx.shadowBlur = 18;
+        starPath(s.x, s.y, 5, r, r*0.48);
+        ctx.fillStyle = s.inside ? insideFill : idleFill; 
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = 3; ctx.strokeStyle = stroke; ctx.stroke();
+
+        // L/R label
+        ctx.font = 'bold 14px ui-sans-serif';
+        ctx.fillStyle = '#0b0f1a';
+        ctx.textAlign='center';
+        ctx.fillText(isLeft?'L':'R', s.x, s.y+5);
+
+        // particles
+        if (s.particles && s.particles.length){
+          for (const p of s.particles){
+            const age = now - p.born;
+            const life = Math.max(0, 1 - age/(p.life));
+            ctx.globalAlpha = life;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 3 + 2*life, 0, Math.PI*2);
+            ctx.fillStyle = p.color;
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        }
+        ctx.restore();
+      });
+
+      // top bar: combo + feedback
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(10, 10, canvas.width - 20, 44);
+
+      ctx.fillStyle = '#fff';
+      ctx.font = '16px ui-monospace,monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`Combo: ${combo}`, 24, 38);
+
+      ctx.textAlign = 'right';
+      ctx.fillText(feedbackMsg || (stars.length? 'Catch the star!' : 'Get ready…'), canvas.width-24, 38);
+      ctx.restore();
+    }
+
+    // ---------- RENDER LOOP (with dt)
+    let _prevNow = performance.now();
+    function renderLoop(){
+      const now = performance.now();
+      const dt = (now - _prevNow)/1000; _prevNow = now;
+
+      drawCameraFrame();
+      if (latestLm) {
+        drawLandmarks(latestLm);
+        updateGame(isArmsUp(latestLm));
+      }
+      updateCoachAndTargets(latestLm, dt, now);
+      drawStarsAndUI(now);
+      requestAnimationFrame(renderLoop);
+    }
+
+    // ---------- START
+    async function start(){
+      if (running) return; running=true;
       try{
-        status('requesting camera…');//printinggggg
+        initAudio(); // user gesture → unlock audio
+        status('requesting camera…');
         const stream = await navigator.mediaDevices.getUserMedia({ 
-            video:{ facingMode:'user', width:1280, height:720 }, 
-            audio:false 
-            // await pauses here until the user grants permission and the stream is ready.
-            // we dont request audio
+          video:{ facingMode:'user', width:1280, height:720 }, 
+          audio:false 
         });
         video.srcObject=stream;
-        await new Promise(res=>video.onloadedmetadata=res);//Wait for metadata (width/height) before doing anything else. 
-        // That’s what the onloadedmetadata promise is for.
+        await new Promise(res=>video.onloadedmetadata=res);
         video.play();
         setCanvasSize();
-        renderLoop();                       // always see camera
+        window.addEventListener('resize', setCanvasSize);
+        renderLoop();
         status('camera ready');
 
-        // Robust constructor detection (Pose vs pose.Pose)
         const PoseCtor = window.Pose || (window.pose && window.pose.Pose);
-        // Depending on the CDN build, the class can be exposed as Pose or pose.Pose.
-        // We pick whichever exists. If neither is found, bail with a status message.
-
         if (!PoseCtor){ status('ERROR: Pose constructor not found'); return; }
 
         const pose = new PoseCtor({
           locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
         });
         pose.setOptions({
-          modelComplexity: 1, //modelComplexity: 0/1/2 (speed vs accuracy).
-          smoothLandmarks: true,//smoothLandmarks: true/false (whether to smooth landmarks over time).
-          minDetectionConfidence: 0.5,//minDetectionConfidence: how sure to be before declaring a person detected.
-          minTrackingConfidence: 0.5//minTrackingConfidence: how sure to be before trusting tracked landmarks.
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
         });
 
         pose.onResults(({ poseLandmarks })=>{
-          // draw landmarks & game HUD on top of camera frame already drawn by renderLoop()
-          drawLandmarks(poseLandmarks);
-          if (poseLandmarks) updateGame(isArmsUp(poseLandmarks));
+          latestLm = poseLandmarks || null;
         });
 
-        // Use Camera helper if available; else, fallback RAF loop
         if (typeof Camera === 'function'){
           const cam = new Camera(video, {
             onFrame: async () => { await pose.send({ image: video }); },
             width: canvas.width, height: canvas.height
           });
           cam.start();
-          status('running… raise both wrists above shoulders');
-        //   MediaPipe’s Camera helper pulls frames from <video> and calls the model for you.
-
+          status('running… single falling star (L/R) — hit to spawn the next!');
         } else {
           status('no Camera helper; using fallback loop');
           (async function loop(){
             await pose.send({ image: video });
             requestAnimationFrame(loop);
-            // if that helper isn’t present, we manually make a loop with requestAnimationFrame that calls pose.send({ image: video }) every frame.
-            // This is less efficient but works in all environments.
-        })();
+          })();
         }
       }catch(e){
         status('ERROR: ' + (e && e.message ? e.message : e));
