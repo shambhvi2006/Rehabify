@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Rehabify — Single File Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- MediaPipe (order matters; no async/defer) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+
+  <style>
+    :root { --bg:#0b1220; --panel:#0f172a; --text:#e5e7eb; --accent:#22c55e; --muted:#94a3b8; }
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b1220;color:var(--text)}
+    header{position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;background:#0d1324;padding:14px 18px}
+    .wrap{max-width:1100px;margin:0 auto;padding:18px}
+    .stage{position:relative;display:grid;grid-template-columns:300px 1fr;gap:18px}
+    .panel{background:var(--panel);border-radius:16px;padding:14px}
+    .metrics{line-height:1.8} .big{font-weight:700}
+    progress{width:100%;height:12px;border-radius:999px;overflow:hidden}
+    progress::-webkit-progress-bar{background:#1f2937} progress::-webkit-progress-value{background:#7c3aed}
+    .canvas-wrap{position:relative}
+    #overlay{width:min(90vw,750px);height:auto;background:#000;border-radius:16px;display:block}
+    #video{display:none}
+    #mascot{position:absolute;top:12px;right:14px;font-size:56px;pointer-events:none;transform-origin:center}
+    @keyframes bop{0%{transform:translateY(0) rotate(0)}50%{transform:translateY(-10px) rotate(-6deg)}100%{transform:translateY(0) rotate(0)}}
+    #mascot.celebrate{animation:bop .4s ease}
+    .pill{border:0;padding:10px 14px;border-radius:12px;background:var(--accent);color:#081018;cursor:pointer;font-weight:600}
+    .status{position:absolute;left:12px;top:12px;background:rgba(0,0,0,.55);padding:8px 10px;border-radius:10px;font:12px/1.5 ui-monospace,monospace}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rehabify</h1>
+    <button id="startBtn" class="pill">Start Exercise</button>
+  </header>
+
+  <div class="wrap">
+    <div class="stage">
+      <!-- LEFT: HUD -->
+      <div class="panel">
+        <div class="metrics">
+          <div>Score: <span class="big" id="score">0</span></div>
+          <div>Streak: <span class="big" id="streak">0</span></div>
+          <div>Energy:</div>
+          <progress id="energy" value="100" max="100"></progress>
+        </div>
+      </div>
+
+      <!-- RIGHT: CAMERA + CANVAS -->
+      <div class="canvas-wrap">
+        <video id="video" autoplay muted playsinline></video>
+        <div id="mascot">🕺</div>
+        <canvas id="overlay"></canvas>
+        <div class="status" id="status">idle…</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ---------- DOM
+    const video   = document.getElementById('video');
+    const canvas  = document.getElementById('overlay');
+    const ctx     = canvas.getContext('2d');
+    const startBtn= document.getElementById('startBtn');
+    const scoreEl = document.getElementById('score');
+    const streakEl= document.getElementById('streak');
+    const energyEl= document.getElementById('energy');
+    const mascot  = document.getElementById('mascot');
+    const statusEl= document.getElementById('status');
+    function status(msg){ statusEl.textContent = msg; console.log(msg); }
+
+    //state
+    let score=0, streak=0, energy=100, running=false;//running false helps preventing it from running multiple times
+    let lastRepAt=0, framesCorrect=0;
+    const REP_COOLDOWN_MS=600, NEED_CONSEC_FRAMES=3, VIS_THRESH=0.4;//hum keh rahe hai  ki ek sahi rep has to be held for 0.6sec and ese 3 reps equal to one countable rep
+    //visthreshh??? visibility threshold hai, matlab agar kisi landmark ki visibility is threshold se kam hai to wo consider nahi hoga
+    //but how are we defining landmarkkk?? landmarks are defined as the key points on the body that we want to track, such as the wrists, elbows, and shoulders.
+    // framesCorrect is used to count how many consecutive frames the user has held the correct position
+    //visthresh 0.4 hone ka kya matlab hai? iska matlab hai ki agar kisi landmark ki visibility 0.4 se kam hai to wo landmark consider nahi hoga
+    //toh if i increase the vis thresh the strictness increases? yas queen
+    //landmark = one of the 33 body keypoints (nose, shoulders, elbows, wrists, hips, knees, ankles, etc.).
+    //Threshold = the minimum visibility value we require
+
+    // drawing the camera on the canvas
+    //Must be called after the video metadata loads, otherwise width/height may be 0.
+    //isiliye we use await neeche jake
+    
+    function setCanvasSize(){ canvas.width=video.videoWidth; canvas.height=video.videoHeight; }
+    //That puts the live camera image on the canvas so we can paint on top (dots, text, UI).
+    function drawCameraFrame(){
+      if (video.readyState >= 2) {
+        ctx.save(); ctx.scale(-1,1);//mirrorrrrrr kar deta hai videoooooo whoop whoop
+        ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);//this is getting the live video on the canvas
+        ctx.restore();
+      }
+    }
+    function renderLoop(){ drawCameraFrame(); requestAnimationFrame(renderLoop); }
+    //A perpetual loop that always paints the latest camera frame—even if the ML model hasn’t produced landmarks yet. 
+    // This guarantees you can see yourself.
+
+
+    //the dotiesssssss
+    function drawLandmarks(lms){//lms is the array of landmarks from mediapipe
+      //each item looks like {x: 0.5, y: 0.5, visibility: 0.8} with x/y normalized in [0,1] relative to the video frame 
+      // (origin is top-left, so smaller y = higher).
+      if (!lms) return;
+      ctx.fillStyle='#FFC0CB';
+      for (const p of lms){
+        const x=(1-p.x)*canvas.width, y=p.y*canvas.height; // mirroring x warna instead of 1-p.x we would do p.x
+        ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.fill();//these are the dots on the canvas
+        // draw visibility as a circle radius 3px
+        //what is math.pi*2? Math.PI*2 is a full circle in radians (360 degrees).
+      }
+    }
+
+
+    const visOK=p=>!p || p.visibility===undefined || p.visibility>=VIS_THRESH;//decide if a single landmark is reliable enough to use.
+    //visibility: a confidence value from ~0 to 1. Higher = the model is more certain that landmark is visible/not occluded.
+    function angle(a,b,c){
+      const abx=a.x-b.x, aby=a.y-b.y, cbx=c.x-b.x, cby=c.y-b.y;
+      const dot=abx*cbx+aby*cby, mag=Math.hypot(abx,aby)*Math.hypot(cbx,cby)+1e-6;
+      return Math.acos(Math.max(-1,Math.min(1,dot/mag)))*180/Math.PI;
+
+      //here we are computing the angles formed by the three points a, b, and c using the dot product formula.
+      //b will be the elbow joint 
+      //toh ba aur bc nikalke
+      //cos θ = (BA · BC) / (|BA| |BC|) = (abx*cbx + aby*cby) / (|BA||BC|)
+      //+ 1e-6 to the denominator: avoids division by zero if a limb is perfectly straight/zero-length due to noise.
+      //Math.max(-1, Math.min(1, ...)): clamps for tiny floating-point errors 
+      // so acos() never gets a value slightly outside [-1,1]
+    }
+    //Why we need it: to check elbow “openness” (e.g., > 120°) so half-bent arms don’t accidentally count as “arms up.”
+
+
+    // ---------- exercise logic
+    function isArmsUp(lm){
+      const Ls=lm[11], Le=lm[13], Lw=lm[15];//left shoulder,elbow,wrist 
+
+      const Rs=lm[12], Re=lm[14], Rw=lm[16];//right shoulder,elbow,wrist
+
+      if (![Ls,Le,Lw,Rs,Re,Rw].every(visOK)) return false;
+      //If any of those six points is missing or has low visibility, we don’t trust the frame → return false
+
+      const wristsAbove=(Lw.y < Ls.y - 0.02) && (Rw.y < Rs.y - 0.02);
+      //So “wrist above shoulder” means wrist.y < shoulder.y.
+      //The extra - 0.02 is a margin (~2% of frame height) so borderline frames don’t flicker between true/false.
+      //Both wrists must be above their own shoulder.
+      const leftElbow=angle(Ls,Le,Lw), rightElbow=angle(Rs,Re,Rw);//abh elbow beech mei hai toh apne aap b ban jayega w2e can exchange the shoulder and wrist
+      //angle yahan mera wala hi function hai
+      const elbowsOpen=(leftElbow>120 && rightElbow>120);
+      //110 easier and 140 stricter
+
+      // debug
+    //   ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(12,12,240,70);
+    //   ctx.fillStyle='#fff'; ctx.font='14px ui-monospace,monospace';
+    //   ctx.fillText(`wristsAbove: ${wristsAbove}`, 20, 34);
+    //   ctx.fillText(`L/R elbow: ${leftElbow|0} / ${rightElbow|0}`, 20, 56);
+      //This puts a small box on the canvas with live values—super useful while testing.
+      //jo mere running wale ke peeche box aata hai the wristabove true ya false
+
+      // --- debug HUD (top-right) ---
+        const pad = 12;
+        const boxW = 240, boxH = 70;
+        const x = canvas.width - pad - boxW;  // top-right X
+        const y = pad;                        // top-right Y
+
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(x, y, boxW, boxH);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px ui-monospace,monospace';
+        ctx.fillText(`wristsAbove: ${wristsAbove}`, x + 8, y + 22);
+        ctx.fillText(`L/R elbow: ${leftElbow|0} / ${rightElbow|0}`, x + 8, y + 44);
+        //This uses the current canvas.width, so it’ll stay glued to the top-right even if the canvas size changes.
+
+
+      return wristsAbove && elbowsOpen;
+    }
+
+
+    function bopMascot(){ 
+        mascot.classList.remove('celebrate'); 
+        void mascot.offsetWidth; //Force reflow with void mascot.offsetWidth;: This is a tiny trick to make the browser “commit” the removal, so the next addition is treated as a fresh animation.
+        mascot.classList.add('celebrate'); 
+    }
+    function updateGame(correct){//correct: boolean from isArmsUp(lm) for this frame only
+      const now=Date.now();//Current time in ms; used to ensure we don’t count multiple reps too quickly
+      if (correct) framesCorrect++; else framesCorrect=0;//We require NEED_CONSEC_FRAMES correct frames in a row (e.g., 3) so momentary noise doesn’t score
+      if (framesCorrect>=NEED_CONSEC_FRAMES && (now-lastRepAt)>REP_COOLDOWN_MS){
+        // pose has been stable for a short moment
+        //  This prevents “holding” a pose from racking up points.
+        score+=10; streak+=1; energy=Math.min(100, energy+4);
+        lastRepAt=now; framesCorrect=0; bopMascot();
+      } else if (!correct) {
+        streak=0; energy=Math.max(0, energy-0.4);
+        // break the streak, motivating consistent form.
+        // drain energy slightly, with a floor at 0.
+      }
+      scoreEl.textContent=score; streakEl.textContent=streak; energyEl.value=energy;
+    }
+
+    // ---------- start
+    async function start(){//async await so that we wait for the camera to get loaded
+      if (running) return; running=true;//running is a guard so you don’t start two capture loops if the button is clicked twice
+      try{
+        status('requesting camera…');//printinggggg
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video:{ facingMode:'user', width:1280, height:720 }, 
+            audio:false 
+            // await pauses here until the user grants permission and the stream is ready.
+            // we dont request audio
+        });
+        video.srcObject=stream;
+        await new Promise(res=>video.onloadedmetadata=res);//Wait for metadata (width/height) before doing anything else. 
+        // That’s what the onloadedmetadata promise is for.
+        video.play();
+        setCanvasSize();
+        renderLoop();                       // always see camera
+        status('camera ready');
+
+        // Robust constructor detection (Pose vs pose.Pose)
+        const PoseCtor = window.Pose || (window.pose && window.pose.Pose);
+        // Depending on the CDN build, the class can be exposed as Pose or pose.Pose.
+        // We pick whichever exists. If neither is found, bail with a status message.
+
+        if (!PoseCtor){ status('ERROR: Pose constructor not found'); return; }
+
+        const pose = new PoseCtor({
+          locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`
+        });
+        pose.setOptions({
+          modelComplexity: 1, //modelComplexity: 0/1/2 (speed vs accuracy).
+          smoothLandmarks: true,//smoothLandmarks: true/false (whether to smooth landmarks over time).
+          minDetectionConfidence: 0.5,//minDetectionConfidence: how sure to be before declaring a person detected.
+          minTrackingConfidence: 0.5//minTrackingConfidence: how sure to be before trusting tracked landmarks.
+        });
+
+        pose.onResults(({ poseLandmarks })=>{
+          // draw landmarks & game HUD on top of camera frame already drawn by renderLoop()
+          drawLandmarks(poseLandmarks);
+          if (poseLandmarks) updateGame(isArmsUp(poseLandmarks));
+        });
+
+        // Use Camera helper if available; else, fallback RAF loop
+        if (typeof Camera === 'function'){
+          const cam = new Camera(video, {
+            onFrame: async () => { await pose.send({ image: video }); },
+            width: canvas.width, height: canvas.height
+          });
+          cam.start();
+          status('running… raise both wrists above shoulders');
+        //   MediaPipe’s Camera helper pulls frames from <video> and calls the model for you.
+
+        } else {
+          status('no Camera helper; using fallback loop');
+          (async function loop(){
+            await pose.send({ image: video });
+            requestAnimationFrame(loop);
+            // if that helper isn’t present, we manually make a loop with requestAnimationFrame that calls pose.send({ image: video }) every frame.
+            // This is less efficient but works in all environments.
+        })();
+        }
+      }catch(e){
+        status('ERROR: ' + (e && e.message ? e.message : e));
+        console.error(e);
+      }
+    }
+    startBtn.addEventListener('click', start);
+  </script>
+</body>
+</html>
