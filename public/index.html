@@ -211,58 +211,44 @@
     let ascending = true;
     let starRadius = 40;
 
-    function setupRainbowStars() {
-      const N = 4; // Number of stars per side
-      const arcRadius = canvas.width * 0.27;
-      const baseY = canvas.height * 0.74; // Hip/waist level
-      const topY = canvas.height * 0.19;  // Overhead
-      const midY = (baseY + topY) / 2;
-      const cxL = canvas.width * 0.29;
-      const cxR = canvas.width * 0.715;
-      starRadius = Math.max(22, Math.min(44, canvas.width * 0.023));
+    function setupRainbowStars(reverse = false) {
+      const N = 10; // Total stars for semicircle
+      const arcRadius = canvas.width * 0.32;
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height * 0.78;
+      // Increase star size
+      starRadius = Math.max(38, Math.min(70, canvas.width * 0.045));
       rainbowStars = [];
-      // Use angles so all stars are evenly spaced along an arc
-      // Arc spans from 65deg to 115deg for each arm (~50deg arc)
       const degToRad = Math.PI / 180;
-      const thetaStart = 115 * degToRad;
-      const thetaEnd = 65 * degToRad;
+      const thetaStart = 180 * degToRad;
+      const thetaEnd = 0 * degToRad;
+      let blueNumbers = reverse ? [5,4,3,2,1] : [1,2,3,4,5];
+      let pinkNumbers = reverse ? [1,2,3,4,5] : [5,4,3,2,1];
       for (let i = 0; i < N; i++) {
         const theta = thetaStart + (thetaEnd - thetaStart) * (i / (N - 1));
-        // Left group (blue, left wrist)
+        const isLeft = i < N / 2;
         rainbowStars.push({
-          x: cxL + arcRadius * Math.cos(theta),
-          y: midY - arcRadius * Math.sin(theta),
+          x: centerX + arcRadius * Math.cos(theta),
+          y: centerY - arcRadius * Math.sin(theta),
           hit: false,
-          number: i + 1,
-          side: SIDE.L,
-          color: '#4da3ff'
-        });
-        // Right group (pink, right wrist, mirrored)
-        rainbowStars.push({
-          x: cxR - arcRadius * Math.cos(theta),
-          y: midY - arcRadius * Math.sin(theta),
-          hit: false,
-          number: i + 1,
-          side: SIDE.R,
-          color: '#ff6fb0'
+          number: isLeft ? blueNumbers[i] : pinkNumbers[i - N / 2],
+          side: isLeft ? SIDE.L : SIDE.R,
+          color: isLeft ? '#4da3ff' : '#ff6fb0'
         });
       }
       currentStepL = 0;
       currentStepR = 0;
-      ascending = true;
+      ascending = !reverse;
     }
 
     function drawRainbowStars() {
       for (let s = 0; s < rainbowStars.length; s++) {
         const star = rainbowStars[s];
         ctx.save();
-        let isCurrent =
-          (star.side === SIDE.L && s % 2 === 0 && s / 2 === currentStepL && !star.hit) ||
-          (star.side === SIDE.R && s % 2 === 1 && (s - 1) / 2 === currentStepR && !star.hit);
-
+        // All stars glow, regardless of hit or current
         ctx.globalAlpha = star.hit ? 0.18 : 1;
-        ctx.shadowColor = isCurrent ? star.color : 'rgba(0,0,0,0)';
-        ctx.shadowBlur = isCurrent ? 30 : 0;
+        ctx.shadowColor = star.color;
+        ctx.shadowBlur = 38;
         ctx.fillStyle = star.color;
         starPath(star.x, star.y, 5, starRadius, starRadius * 0.44);
         ctx.fill();
@@ -271,7 +257,8 @@
         ctx.strokeStyle = '#fff';
         ctx.stroke();
         ctx.fillStyle = '#fff';
-        ctx.font = `bold ${starRadius}px sans-serif`;
+        // Make numbers smaller inside the stars
+        ctx.font = `bold ${Math.floor(starRadius * 0.55)}px sans-serif`;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText(star.number, star.x, star.y);
@@ -280,47 +267,39 @@
     }
 
     function updateRainbowBilateralHits(lm) {
-      // Left
-      let starL = rainbowStars[0 + currentStepL * 2];
-      if (
-        starL &&
-        !starL.hit &&
-        lm[15] && lm[15].visibility > 0.25 &&
-        dist(toPix(lm[15]), starL) <= starRadius + 30
-      ) {
-        starL.hit = true;
-        playDing(); bopMascot();
-        if (ascending) currentStepL++;
-        else currentStepL--;
+      // Check all stars for left and right wrist input
+      if (lm[15] && lm[15].visibility > 0.25) {
+        const wristL = toPix(lm[15]);
+        for (let i = 0; i < rainbowStars.length; i++) {
+          const star = rainbowStars[i];
+          if (star.side === SIDE.L && !star.hit && dist(wristL, star) <= starRadius + 30) {
+            star.hit = true;
+            playDing(); bopMascot();
+          }
+        }
       }
-      // Right
-      let starR = rainbowStars[1 + currentStepR * 2];
-      if (
-        starR &&
-        !starR.hit &&
-        lm[16] && lm[16].visibility > 0.25 &&
-        dist(toPix(lm[16]), starR) <= starRadius + 30
-      ) {
-        starR.hit = true;
-        playDing(); bopMascot();
-        if (ascending) currentStepR++;
-        else currentStepR--;
+      if (lm[16] && lm[16].visibility > 0.25) {
+        const wristR = toPix(lm[16]);
+        for (let i = 0; i < rainbowStars.length; i++) {
+          const star = rainbowStars[i];
+          if (star.side === SIDE.R && !star.hit && dist(wristR, star) <= starRadius + 30) {
+            star.hit = true;
+            playDing(); bopMascot();
+          }
+        }
       }
-      // State changes
-      const finishedUp = ascending && currentStepL >= 4 && currentStepR >= 4;
-      const finishedDown = !ascending && currentStepL < 1 && currentStepR < 1;
-      if (finishedUp) {
-        ascending = false;
-        currentStepL = 3; currentStepR = 3;
+      // Check if all stars are hit (going up)
+      if (ascending && rainbowStars.every(s => s.hit)) {
+        // Recreate stars in reverse order for downward phase
+        setupRainbowStars(true);
         status("Great! Now lower both arms and burst the stars coming down!");
-        for (let s of rainbowStars) s.hit = false;
       }
-      if (finishedDown) {
+      // Check if all stars are hit (going down)
+      if (!ascending && rainbowStars.every(s => s.hit)) {
         status("Excellent! Rainbow completed. Raise again to start over!");
         setTimeout(() => {
-          for (let s of rainbowStars) s.hit = false;
-          ascending = true; currentStepL = 0; currentStepR = 0;
-          status("Raise both arms to burst stars from 1 to 4!");
+          setupRainbowStars(false);
+          status("Raise both arms to burst stars from 1 to 5!");
         }, 1600);
       }
     }
@@ -736,4 +715,31 @@
     status(`Current Exercise: ${currentExercise.name}`);
   </script>
 </body>
+</html>
+</html>
+    currentExerciseIndex = 0;
+    repCount = 0;
+    currentExercise = exercises[currentExerciseIndex];
+    updateExerciseInfo();
+    status(`Current Exercise: ${currentExercise.name}`);
+  </script>
+</body>
+</html>
+</html>
+    currentExercise = exercises[currentExerciseIndex];
+    updateExerciseInfo();
+    status(`Current Exercise: ${currentExercise.name}`);
+  </script>
+</body>
+</html>
+</html>
+</html>
+</html>
+    updateExerciseInfo();
+    status(`Current Exercise: ${currentExercise.name}`);
+  </script>
+</body>
+</html>
+</html>
+</html>
 </html>
