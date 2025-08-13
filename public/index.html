@@ -42,6 +42,7 @@
       <div class="panel">
         <div class="metrics">
           <div>Score: <span class="big" id="score">0</span></div>
+          <div id="exerciseInfo"></div>
           <div>Stars: <span class="big" id="stars">0</span></div>
           <div>Streak: <span class="big" id="streak">0</span></div>
           <div>Energy:</div>
@@ -59,6 +60,7 @@
     </div>
   </div>
 
+  <script src="exercises.js"></script>
   <script>
     // ---------- DOM
     const video   = document.getElementById('video');
@@ -71,6 +73,7 @@
     const energyEl= document.getElementById('energy');
     const mascot  = document.getElementById('mascot');
     const statusEl= document.getElementById('status');
+    const exerciseInfoEl = document.getElementById('exerciseInfo');
     function status(msg){ statusEl.textContent = msg; console.log(msg); }
 
     // ---------- GAME/POSE STATE
@@ -78,6 +81,11 @@
     let starCount=0;
     let lastRepAt=0, framesCorrect=0;
     let latestLm = null;
+
+    // Track current exercise and reps
+    let currentExerciseIndex = 0;
+    let repCount = 0;
+    let currentExercise = exercises[currentExerciseIndex];
 
     // Tunables
     const REP_COOLDOWN_MS=600, NEED_CONSEC_FRAMES=3, VIS_THRESH=0.25;
@@ -109,9 +117,10 @@
       canvas.width=video.videoWidth; 
       canvas.height=video.videoHeight; 
       TARGET_SPAWN_Y = -60;                     
-      //Setting TARGET_SPAWN_Y to -60 means the star starts 60 pixels above the visible area (off-screen), then falls into view.
       MISS_Y = canvas.height * MISS_Y_FRAC;     
-      //This calculates the “miss line”: if a star falls below this Y value without being hit, it counts as missed and disappears.
+      if (currentExercise.criteria === 'shoulderAbduction') {
+        setupRainbowStars();
+      }
     }
     function drawCameraFrame(){
       if (video.readyState >= 2) {
@@ -167,18 +176,180 @@
       return wristsAbove && elbowsOpen;
     }
 
+    // Pose evaluation functions
+    function shoulderFlexion(lm) {
+      if (!lm[11] || !lm[15]) return false;
+      // Left wrist above left shoulder by 5% of image height
+      return lm[15].y < lm[11].y - 0.05;
+    }
+
+    function sitToStand(lm) {
+      // Example: hips (23) rise above a certain threshold
+      if (!lm[23]) return false;
+      // Check if left hip is above 70% of image height
+      return lm[23].y < 0.70;
+    }
+
+    function evaluatePose(criteria, lm) {
+      switch (criteria) {
+        case "shoulderFlexion": return shoulderFlexion(lm);
+        case "sitToStand": return sitToStand(lm);
+        default: return false;
+      }
+    }
+
     function bopMascot(){ 
       mascot.classList.remove('celebrate'); 
       void mascot.offsetWidth;
       mascot.classList.add('celebrate'); 
     }
 
+    // ---------- UNIFIED RAINBOW ARC STARS (shoulder abduction only)
+    const SIDE = { L: 'left', R: 'right' };
+    let rainbowStars = [];
+    let currentStepL = 0, currentStepR = 0;
+    let ascending = true;
+    let starRadius = 40;
+
+    function setupRainbowStars() {
+      const N = 4; // Number of stars per side
+      const arcRadius = canvas.width * 0.27;
+      const baseY = canvas.height * 0.74; // Hip/waist level
+      const topY = canvas.height * 0.19;  // Overhead
+      const midY = (baseY + topY) / 2;
+      const cxL = canvas.width * 0.29;
+      const cxR = canvas.width * 0.715;
+      starRadius = Math.max(22, Math.min(44, canvas.width * 0.023));
+      rainbowStars = [];
+      // Use angles so all stars are evenly spaced along an arc
+      // Arc spans from 65deg to 115deg for each arm (~50deg arc)
+      const degToRad = Math.PI / 180;
+      const thetaStart = 115 * degToRad;
+      const thetaEnd = 65 * degToRad;
+      for (let i = 0; i < N; i++) {
+        const theta = thetaStart + (thetaEnd - thetaStart) * (i / (N - 1));
+        // Left group (blue, left wrist)
+        rainbowStars.push({
+          x: cxL + arcRadius * Math.cos(theta),
+          y: midY - arcRadius * Math.sin(theta),
+          hit: false,
+          number: i + 1,
+          side: SIDE.L,
+          color: '#4da3ff'
+        });
+        // Right group (pink, right wrist, mirrored)
+        rainbowStars.push({
+          x: cxR - arcRadius * Math.cos(theta),
+          y: midY - arcRadius * Math.sin(theta),
+          hit: false,
+          number: i + 1,
+          side: SIDE.R,
+          color: '#ff6fb0'
+        });
+      }
+      currentStepL = 0;
+      currentStepR = 0;
+      ascending = true;
+    }
+
+    function drawRainbowStars() {
+      for (let s = 0; s < rainbowStars.length; s++) {
+        const star = rainbowStars[s];
+        ctx.save();
+        let isCurrent =
+          (star.side === SIDE.L && s % 2 === 0 && s / 2 === currentStepL && !star.hit) ||
+          (star.side === SIDE.R && s % 2 === 1 && (s - 1) / 2 === currentStepR && !star.hit);
+
+        ctx.globalAlpha = star.hit ? 0.18 : 1;
+        ctx.shadowColor = isCurrent ? star.color : 'rgba(0,0,0,0)';
+        ctx.shadowBlur = isCurrent ? 30 : 0;
+        ctx.fillStyle = star.color;
+        starPath(star.x, star.y, 5, starRadius, starRadius * 0.44);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = 2.1;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${starRadius}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(star.number, star.x, star.y);
+        ctx.restore();
+      }
+    }
+
+    function updateRainbowBilateralHits(lm) {
+      // Left
+      let starL = rainbowStars[0 + currentStepL * 2];
+      if (
+        starL &&
+        !starL.hit &&
+        lm[15] && lm[15].visibility > 0.25 &&
+        dist(toPix(lm[15]), starL) <= starRadius + 30
+      ) {
+        starL.hit = true;
+        playDing(); bopMascot();
+        if (ascending) currentStepL++;
+        else currentStepL--;
+      }
+      // Right
+      let starR = rainbowStars[1 + currentStepR * 2];
+      if (
+        starR &&
+        !starR.hit &&
+        lm[16] && lm[16].visibility > 0.25 &&
+        dist(toPix(lm[16]), starR) <= starRadius + 30
+      ) {
+        starR.hit = true;
+        playDing(); bopMascot();
+        if (ascending) currentStepR++;
+        else currentStepR--;
+      }
+      // State changes
+      const finishedUp = ascending && currentStepL >= 4 && currentStepR >= 4;
+      const finishedDown = !ascending && currentStepL < 1 && currentStepR < 1;
+      if (finishedUp) {
+        ascending = false;
+        currentStepL = 3; currentStepR = 3;
+        status("Great! Now lower both arms and burst the stars coming down!");
+        for (let s of rainbowStars) s.hit = false;
+      }
+      if (finishedDown) {
+        status("Excellent! Rainbow completed. Raise again to start over!");
+        setTimeout(() => {
+          for (let s of rainbowStars) s.hit = false;
+          ascending = true; currentStepL = 0; currentStepR = 0;
+          status("Raise both arms to burst stars from 1 to 4!");
+        }, 1600);
+      }
+    }
+
+    // ---------- GAME LOGIC
     function updateGame(correct){
       const now=Date.now();
       if (correct) framesCorrect++; else framesCorrect=0;
       if (framesCorrect>=NEED_CONSEC_FRAMES && (now-lastRepAt)>REP_COOLDOWN_MS){
         score+=10; streak+=1; energy=Math.min(100, energy+4);
         lastRepAt=now; framesCorrect=0; bopMascot();
+        repCount++; // Increment reps done for the exercise
+        updateExerciseInfo();
+
+        // Progress to next exercise if completed
+        if (repCount >= currentExercise.repetitions_target) {
+          currentExerciseIndex++;
+          if (currentExerciseIndex < exercises.length) {
+            currentExercise = exercises[currentExerciseIndex];
+            repCount = 0;
+            updateExerciseInfo();
+            status(`Level Up! Now: ${currentExercise.name}`);
+            if (currentExercise.criteria === 'shoulderAbduction') {
+              setupRainbowStars();
+            }
+          } else {
+            status('All exercises complete! 🎉');
+          }
+        }
       } else if (!correct) {
         streak=0; energy=Math.max(0, energy-0.4);
       }
@@ -199,8 +370,6 @@
     const NEXT_DELAY_MS = 300;                     // delay before next star appears
 
     const SMOOTH_ALPHA = 0.35;
-    const SIDE = { L:'left', R:'right' };
-
     let stars = []; // at most 1 item
     let lastHitAt = 0;
     let feedbackMsg = '';
@@ -262,13 +431,32 @@
 
     function spawnSingleStar(now){
       if (!SINGLE_STAR_MODE) return;
-      if (stars.length>0 || now < nextAllowedSpawnAt) return;
-      const lane = Math.floor(Math.random()*LANES.length);
-      const side = (Math.random()<0.5) ? SIDE.L : SIDE.R;
-      const baseR = Math.max(30, Math.min(60, canvas.width*0.035));
-      const x = canvas.width * LANES[lane];
+      if (stars.length > 0 || now < nextAllowedSpawnAt) return;
+
+      // Find which Mediapipe landmark to use
+      const lmIndex = currentExercise.criteria === 'shoulderFlexion' ? 15 :
+                      currentExercise.criteria === 'sitToStand' ? 23 :
+                      null;
+
+      let x = canvas.width / 2; // fallback center
+      let y = TARGET_SPAWN_Y;   // always start just offscreen
+
+      if (lmIndex !== null && latestLm && latestLm[lmIndex]) {
+        const targetPix = toPix(latestLm[lmIndex]);
+        x = targetPix.x;
+        // For shoulder flexion, spawn at ~36% canvas height; for sit-to-stand, ~70%
+        y = currentExercise.criteria === 'shoulderFlexion'
+            ? canvas.height * 0.36
+            : currentExercise.criteria === 'sitToStand'
+              ? canvas.height * 0.70
+              : TARGET_SPAWN_Y;
+      }
+
+      const side = lmIndex === 15 ? SIDE.L : SIDE.R;
+      const baseR = Math.max(30, Math.min(60, canvas.width * 0.035));
+
       stars = [{
-        x, y: TARGET_SPAWN_Y, r: baseR,
+        x, y, r: baseR,
         vy: NOTE_SPEED_PX_S, side,
         spawnedAt: now,
         hit:false, hitAt:0, holdFrames:0, inside:false,
@@ -462,10 +650,19 @@
       drawCameraFrame();
       if (latestLm) {
         drawLandmarks(latestLm);
-        updateGame(isArmsUp(latestLm));
+        if (currentExercise.criteria === 'shoulderAbduction') {
+          drawRainbowStars();
+          updateRainbowBilateralHits(latestLm);
+        } else {
+          updateGame(evaluatePose(currentExercise.criteria, latestLm));
+          updateCoachAndTargets(latestLm, dt, now);
+          drawStarsAndUI(now);
+        }
+      } else {
+        if (currentExercise.criteria !== 'shoulderAbduction') {
+          drawStarsAndUI(now);
+        }
       }
-      updateCoachAndTargets(latestLm, dt, now);
-      drawStarsAndUI(now);
       requestAnimationFrame(renderLoop);
     }
 
@@ -524,6 +721,19 @@
       }
     }
     startBtn.addEventListener('click', start);
+
+    // Update exercise info display
+    function updateExerciseInfo() {
+      exerciseInfoEl.textContent =
+        `${currentExercise.name}: ${currentExercise.description} (${repCount}/${currentExercise.repetitions_target})`;
+    }
+
+    // Initialize everything at startup
+    currentExerciseIndex = 0;
+    repCount = 0;
+    currentExercise = exercises[currentExerciseIndex];
+    updateExerciseInfo();
+    status(`Current Exercise: ${currentExercise.name}`);
   </script>
 </body>
 </html>
